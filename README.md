@@ -1,9 +1,3 @@
-I'll analyze your project structure and create a comprehensive README draft for you. Let me review the codebase to understand the scope and capabilities.
-
-Based on my review of your project, here's a **draft README** for RustyJS:
-
----
-
 # RustyJS: JavaScript DSL & Runtime in Rust
 
 A Rust-based JavaScript interpreter and compiler infrastructure designed to execute JavaScript code within Rust environments and compile JS directly to Rust binaries.
