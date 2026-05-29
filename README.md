@@ -1,31 +1,12 @@
-# RJS
+Js-like scripting for Rust projects.
+#
+Our Rust Javascript 'DSL' aims to provide a JavaScript-like experience in the context of a rust project. Someone who is familiar with JavaScript could effectively write a program in Rust but using syntax and patterns familiar to them.
+This lowers berrier to entry when it comes to contributing on pojects and creates a unique entry point in the Rust world for existing Javascript developers.
 
-### Js-like scripting for Rust projects.
+The long term goal of this project is to get complete coverage of all the Javascript features so that you could theoretically port all your JS code to Rust by copy and pasting your code from one project to the other or possibly using some project converter tool.
+#
+checkout
 
- 
+the example here https://github.com/iFrogHop2Worlds/js_rust_dsl/blob/main/js_rust_dsl/js_example/src/main.rs
 
-RJS aims to provide a JavaScript-like experience in the context of a rust project.
-
-Benefits
-
-* Code reuse. If you're moving from Js to Rust, you can port your code over by copy and pasting.
-* Accessibility. Using scripting for extensions and plugins can open up more potential contributors to your project.
-* Performance and Safety. Get Access to proper concurrency and benefit from Rust's built-in safety model while writing regular Js
-* Mix Js and Rust code in a single codebase. Good for gradually porting programs or gradual emersion into Rust without sacrificing productivity.
-  So someone who is familiar with JavaScript could effectively write a program in Rust but
-  using syntax and patterns familiar to them.
-
- 
-
-Check out the js\_example here to see basic scripting examples
-https://github.com/iFrogHop2Worlds/js\_rust\_dsl/blob/main/js\_rust\_dsl/js\_example/src/main.rs
-
- 
-
-Documentation coming soon.
-
- 
-
-Feature Table
-https://docs.google.com/spreadsheets/d/e/2PACX-1vSsLnJp4a1vbGhN02QRE8O2lrKVJJ9WtuGAIj68sfa0XSltmP66i-snS\_T4KoQ4SpSMKhtfgCu8Z7Po/pubhtml
-
+Here is a checklist of what has been implemented and what still needs to be. https://docs.google.com/spreadsheets/d/1VUxPrBbnbie0kQTvzyJTrXUBxv8fhvIzduGSrU37OrY/edit?gid=68910690#gid=68910690
