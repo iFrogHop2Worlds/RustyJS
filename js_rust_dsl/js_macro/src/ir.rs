@@ -108,6 +108,8 @@ fn lower_expression_to_ir(expr: &parser::JsExpression) -> IrExpression {
                 parser::JsBinaryOp::Add => "+",
                 parser::JsBinaryOp::Subtract => "-",
                 parser::JsBinaryOp::Multiply => "*",
+                parser::JsBinaryOp::Divide => "/",
+                parser::JsBinaryOp::Remainder => "%",
                 parser::JsBinaryOp::Equal => "==",
                 parser::JsBinaryOp::NotEqual => "!=",
                 parser::JsBinaryOp::StrictEqual => "===",
@@ -270,6 +272,20 @@ fn lower_statement_to_ir(stmt: &parser::JsStatement) -> IrStatement {
                 parser::JsExpression::Assignment(ident, value_expr) => Box::new(
                     IrStatement::Assignment(ident.to_string(), lower_expression_to_ir(value_expr)),
                 ),
+                parser::JsExpression::MemberAssignment(obj, prop, value) => {
+                    Box::new(IrStatement::MemberAssignment(
+                        lower_expression_to_ir(obj),
+                        prop.to_string(),
+                        lower_expression_to_ir(value),
+                    ))
+                }
+                parser::JsExpression::IndexAssignment(obj, index, value) => {
+                    Box::new(IrStatement::IndexAssignment(
+                        lower_expression_to_ir(obj),
+                        lower_expression_to_ir(index),
+                        lower_expression_to_ir(value),
+                    ))
+                }
                 _ => Box::new(IrStatement::Expression(lower_expression_to_ir(incr))),
             }),
             body: for_loop
@@ -497,35 +513,13 @@ fn emit_ir_expression_to_runtime(expr: &IrExpression) -> proc_macro2::TokenStrea
             IrValue::Object(props) => {
                 let entries = props.iter().map(|(k, v)| {
                     let rv = emit_ir_expression_to_runtime(v);
-                    quote! { (#k.to_string(), #rv.evaluate(&temp_context)) }
+                    quote! { (#k.to_string(), #rv) }
                 });
-                quote! {
-                    js_runtime::JsExpression::Literal({
-                        let temp_context = js_runtime::JsExecutionContext {
-                            scope: js_runtime::JsScope::new_root(),
-                            this_context: None
-                        };
-                        let mut map = std::collections::HashMap::new();
-                        for (key, value) in vec![#(#entries),*] {
-                            map.insert(key, value);
-                        }
-                        js_runtime::JsValue::Object(map)
-                    })
-                }
+                quote! { js_runtime::JsExpression::ObjectLiteral(vec![#(#entries),*]) }
             }
             IrValue::Array(elements) => {
                 let emitted: Vec<_> = elements.iter().map(emit_ir_expression_to_runtime).collect();
-                quote! {
-                    js_runtime::JsExpression::Literal(
-                        js_runtime::JsValue::Array({
-                            let temp_context = js_runtime::JsExecutionContext {
-                                scope: js_runtime::JsScope::new_root(),
-                                this_context: None
-                            };
-                            vec![#(#emitted.evaluate(&temp_context)),*]
-                        })
-                    )
-                }
+                quote! { js_runtime::JsExpression::ArrayLiteral(vec![#(#emitted),*]) }
             }
         },
         IrExpression::Identifier(name) => {

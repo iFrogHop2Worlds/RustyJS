@@ -4,7 +4,7 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse::{Parse, ParseStream, Result};
 use syn::punctuated::Punctuated;
-use syn::{Ident, Lit, Token, braced, parenthesized, parse_macro_input};
+use syn::{Ident, Lit, LitStr, Token, braced, parenthesized, parse_macro_input};
 
 pub(crate) mod parser {
     use super::*;
@@ -80,7 +80,7 @@ pub(crate) mod parser {
 
     #[derive(Clone)]
     pub struct JsProperty {
-        pub(crate) key: Ident,
+        pub(crate) key: String,
         pub(crate) value: JsExpression,
     }
 
@@ -98,6 +98,8 @@ pub(crate) mod parser {
         Add,
         Subtract,
         Multiply,
+        Divide,
+        Remainder,
         Equal,
         NotEqual,
         StrictEqual,
@@ -175,10 +177,16 @@ pub(crate) mod parser {
     impl Parse for JsStatement {
         fn parse(input: ParseStream) -> Result<Self> {
             let lookahead = input.lookahead1();
-            if lookahead.peek(Token![let]) || lookahead.peek(self::_const) {
+            if lookahead.peek(Token![let])
+                || lookahead.peek(Token![const])
+                || lookahead.peek(self::_const)
+            {
                 let is_const = if input.peek(Token![let]) {
                     input.parse::<Token![let]>()?;
                     false
+                } else if input.peek(Token![const]) {
+                    input.parse::<Token![const]>()?;
+                    true
                 } else {
                     input.parse::<self::_const>()?;
                     true
@@ -200,7 +208,13 @@ pub(crate) mod parser {
                 let body = input.parse()?;
                 let else_body = if input.peek(Token![else]) {
                     input.parse::<Token![else]>()?;
-                    Some(input.parse()?)
+                    if input.peek(Token![if]) {
+                        Some(JsBlock {
+                            statements: vec![input.parse()?],
+                        })
+                    } else {
+                        Some(input.parse()?)
+                    }
                 } else {
                     None
                 };
@@ -211,12 +225,16 @@ pub(crate) mod parser {
 
                 let (catch_param, catch_block) = if input.peek(self::catch) {
                     input.parse::<self::catch>()?;
-                    let content;
-                    parenthesized!(content in input);
-                    let param = if content.is_empty() {
-                        None
+                    let param = if input.peek(Paren) {
+                        let content;
+                        parenthesized!(content in input);
+                        if content.is_empty() {
+                            None
+                        } else {
+                            Some(content.parse::<Ident>()?)
+                        }
                     } else {
-                        Some(content.parse::<Ident>()?)
+                        None
                     };
                     let block: JsBlock = input.parse()?;
                     (param, Some(block))
@@ -305,12 +323,62 @@ pub(crate) mod parser {
                 bracketed!(content in input);
                 let index: JsExpression = content.parse()?;
                 expr = JsExpression::IndexAccess(Box::new(expr), Box::new(index));
+            } else if peek_double_plus(input) || peek_double_minus(input) {
+                let op = if peek_double_plus(input) {
+                    input.parse::<Token![+]>()?;
+                    input.parse::<Token![+]>()?;
+                    JsBinaryOp::Add
+                } else {
+                    input.parse::<Token![-]>()?;
+                    input.parse::<Token![-]>()?;
+                    JsBinaryOp::Subtract
+                };
+                let one = JsExpression::Literal(JsLiteral::Number(1.0));
+                expr = match expr {
+                    JsExpression::Identifier(ident) => JsExpression::Assignment(
+                        ident.clone(),
+                        Box::new(JsExpression::BinaryOp(
+                            Box::new(JsExpression::Identifier(ident)),
+                            op,
+                            Box::new(one),
+                        )),
+                    ),
+                    JsExpression::MemberAccess(obj, prop) => JsExpression::MemberAssignment(
+                        obj.clone(),
+                        prop.clone(),
+                        Box::new(JsExpression::BinaryOp(
+                            Box::new(JsExpression::MemberAccess(obj, prop)),
+                            op,
+                            Box::new(one),
+                        )),
+                    ),
+                    JsExpression::IndexAccess(obj, index) => JsExpression::IndexAssignment(
+                        obj.clone(),
+                        index.clone(),
+                        Box::new(JsExpression::BinaryOp(
+                            Box::new(JsExpression::IndexAccess(obj, index)),
+                            op,
+                            Box::new(one),
+                        )),
+                    ),
+                    _ => return Err(syn::Error::new(input.span(), "invalid update target")),
+                };
             } else {
                 break;
             }
         }
 
         Ok(expr)
+    }
+
+    fn peek_double_plus(input: ParseStream) -> bool {
+        let fork = input.fork();
+        fork.parse::<Token![+]>().is_ok() && fork.parse::<Token![+]>().is_ok()
+    }
+
+    fn peek_double_minus(input: ParseStream) -> bool {
+        let fork = input.fork();
+        fork.parse::<Token![-]>().is_ok() && fork.parse::<Token![-]>().is_ok()
     }
 
     fn parse_primary_expression(input: ParseStream) -> Result<JsExpression> {
@@ -401,10 +469,22 @@ pub(crate) mod parser {
     fn parse_multiplicative_expression(input: ParseStream) -> Result<JsExpression> {
         let mut expr = parse_unary_expression(input)?;
 
-        while input.peek(Token![*]) {
-            input.parse::<Token![*]>()?;
+        while (input.peek(Token![*]) && !input.peek(Token![*=]))
+            || (input.peek(Token![/]) && !input.peek(Token![/=]))
+            || (input.peek(Token![%]) && !input.peek(Token![%=]))
+        {
+            let op = if input.peek(Token![*]) {
+                input.parse::<Token![*]>()?;
+                JsBinaryOp::Multiply
+            } else if input.peek(Token![/]) {
+                input.parse::<Token![/]>()?;
+                JsBinaryOp::Divide
+            } else {
+                input.parse::<Token![%]>()?;
+                JsBinaryOp::Remainder
+            };
             let right = parse_unary_expression(input)?;
-            expr = JsExpression::BinaryOp(Box::new(expr), JsBinaryOp::Multiply, Box::new(right));
+            expr = JsExpression::BinaryOp(Box::new(expr), op, Box::new(right));
         }
 
         Ok(expr)
@@ -413,7 +493,9 @@ pub(crate) mod parser {
     fn parse_additive_expression(input: ParseStream) -> Result<JsExpression> {
         let mut expr = parse_multiplicative_expression(input)?; // Change this line
 
-        while input.peek(Token![+]) || input.peek(Token![-]) {
+        while (input.peek(Token![+]) && !input.peek(Token![+=]))
+            || (input.peek(Token![-]) && !input.peek(Token![-=]))
+        {
             if input.peek(Token![+]) {
                 input.parse::<Token![+]>()?;
                 let right = parse_multiplicative_expression(input)?; // Change this line
@@ -527,6 +609,65 @@ pub(crate) mod parser {
                 _ => {
                     // For any other expression type, we can't do assignment, fall through
                 }
+            }
+        } else if input.peek(Token![+=])
+            || input.peek(Token![-=])
+            || input.peek(Token![*=])
+            || input.peek(Token![/=])
+            || input.peek(Token![%=])
+        {
+            let op = if input.peek(Token![+=]) {
+                input.parse::<Token![+=]>()?;
+                JsBinaryOp::Add
+            } else if input.peek(Token![-=]) {
+                input.parse::<Token![-=]>()?;
+                JsBinaryOp::Subtract
+            } else if input.peek(Token![*=]) {
+                input.parse::<Token![*=]>()?;
+                JsBinaryOp::Multiply
+            } else if input.peek(Token![/=]) {
+                input.parse::<Token![/=]>()?;
+                JsBinaryOp::Divide
+            } else {
+                input.parse::<Token![%=]>()?;
+                JsBinaryOp::Remainder
+            };
+            let value = parse_assignment_expression(input)?;
+
+            match &expr {
+                JsExpression::Identifier(ident) => {
+                    return Ok(JsExpression::Assignment(
+                        ident.clone(),
+                        Box::new(JsExpression::BinaryOp(
+                            Box::new(JsExpression::Identifier(ident.clone())),
+                            op,
+                            Box::new(value),
+                        )),
+                    ));
+                }
+                JsExpression::MemberAccess(obj, prop) => {
+                    return Ok(JsExpression::MemberAssignment(
+                        obj.clone(),
+                        prop.clone(),
+                        Box::new(JsExpression::BinaryOp(
+                            Box::new(JsExpression::MemberAccess(obj.clone(), prop.clone())),
+                            op,
+                            Box::new(value),
+                        )),
+                    ));
+                }
+                JsExpression::IndexAccess(obj, index) => {
+                    return Ok(JsExpression::IndexAssignment(
+                        obj.clone(),
+                        index.clone(),
+                        Box::new(JsExpression::BinaryOp(
+                            Box::new(JsExpression::IndexAccess(obj.clone(), index.clone())),
+                            op,
+                            Box::new(value),
+                        )),
+                    ));
+                }
+                _ => {}
             }
         }
 
@@ -669,9 +810,24 @@ pub(crate) mod parser {
 
     impl Parse for JsProperty {
         fn parse(input: ParseStream) -> Result<Self> {
-            let key = input.parse()?;
-            input.parse::<Token![:]>()?;
-            let value = input.parse()?;
+            let (key, shorthand_ident) = if input.peek(LitStr) {
+                (input.parse::<LitStr>()?.value(), None)
+            } else if input.peek(Ident) {
+                let ident = input.parse::<Ident>()?;
+                (ident.to_string(), Some(ident))
+            } else {
+                return Err(input.error("expected object property key"));
+            };
+
+            let value = if input.peek(Token![:]) {
+                input.parse::<Token![:]>()?;
+                input.parse()?
+            } else if let Some(ident) = shorthand_ident {
+                JsExpression::Identifier(ident)
+            } else {
+                return Err(input.error("quoted object property keys require a value"));
+            };
+
             Ok(JsProperty { key, value })
         }
     }

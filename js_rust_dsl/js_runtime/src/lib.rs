@@ -120,6 +120,8 @@ enum Instruction {
     LogicalAnd(usize),
     LogicalOr(usize),
     Call(String, usize),
+    BuildArray(usize),
+    BuildObject(Vec<String>),
     MemberAccess(String),
     IndexAccess,
     MethodCall {
@@ -212,6 +214,8 @@ pub enum JsExpression {
     UnaryOp(String, Box<JsExpression>),
     LogicalOp(Box<JsExpression>, String, Box<JsExpression>),
     Call(String, Vec<JsExpression>),
+    ArrayLiteral(Vec<JsExpression>),
+    ObjectLiteral(Vec<(String, JsExpression)>),
     MemberAccess(Box<JsExpression>, String),
     IndexAccess(Box<JsExpression>, Box<JsExpression>),
     MethodCall {
@@ -234,7 +238,7 @@ pub enum JsErrorKind {
 }
 
 impl JsErrorKind {
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             JsErrorKind::Error => "Error",
             JsErrorKind::TypeError => "TypeError",
@@ -302,7 +306,7 @@ impl JsExpression {
         match self {
             JsExpression::Literal(value) => value.clone(),
             JsExpression::Identifier(name) => {
-                if let Some(value) = builtins::resolve_global(name) {
+                if let Some(value) = builtins::global_property(name) {
                     return value;
                 }
 
@@ -327,6 +331,8 @@ impl JsExpression {
                         (JsValue::Number(a), JsValue::Number(b)) => JsValue::Number(a * b),
                         _ => JsValue::Number(left_val.to_number() * right_val.to_number()),
                     },
+                    "/" => JsValue::Number(left_val.to_number() / right_val.to_number()),
+                    "%" => JsValue::Number(left_val.to_number() % right_val.to_number()),
                     "==" => left_val.equals(&right_val),
                     "!=" => left_val.not_equals(&right_val),
                     "===" => left_val.strict_equals(&right_val),
@@ -371,7 +377,7 @@ impl JsExpression {
                 let arg_values: Vec<JsValue> =
                     args.iter().map(|arg| arg.evaluate(context)).collect();
 
-                if let Some(value) = builtins::call_global_function(func_name, arg_values.clone()) {
+                if let Some(value) = builtins::call_global(func_name, arg_values.clone()) {
                     return value;
                 }
 
@@ -390,6 +396,19 @@ impl JsExpression {
                 } else {
                     JsValue::Undefined
                 }
+            }
+            JsExpression::ArrayLiteral(elements) => JsValue::Array(
+                elements
+                    .iter()
+                    .map(|element| element.evaluate(context))
+                    .collect(),
+            ),
+            JsExpression::ObjectLiteral(properties) => {
+                let mut object = HashMap::new();
+                for (key, value) in properties {
+                    object.insert(key.clone(), value.evaluate(context));
+                }
+                JsValue::Object(object)
             }
             JsExpression::MemberAccess(object, member) => {
                 let obj_val = object.evaluate(context);
@@ -411,7 +430,7 @@ impl JsExpression {
 
                 if let JsExpression::Identifier(obj_name) = object.as_ref() {
                     if let Some(result) =
-                        builtins::try_call_named_method(obj_name, method, arg_values.clone())
+                        builtins::call_global_method(obj_name, method, arg_values.clone())
                     {
                         return result;
                     }
@@ -455,7 +474,8 @@ impl JsStatement {
                         }
                     }
                     JsExpression::Identifier(obj_name) => {
-                        if let Some(mut obj_val) = context.scope.borrow().get(obj_name) {
+                        let existing = context.scope.borrow().get(obj_name);
+                        if let Some(mut obj_val) = existing {
                             obj_val.set_property(member, value.clone());
                             context.scope.borrow_mut().set(obj_name, obj_val);
                         }
@@ -474,7 +494,8 @@ impl JsStatement {
                 let key = index_val.to_property_key();
                 match target {
                     JsExpression::Identifier(name) => {
-                        if let Some(mut obj) = context.scope.borrow().get(name) {
+                        let existing = context.scope.borrow().get(name);
+                        if let Some(mut obj) = existing {
                             obj.set_property(&key, value.clone());
                             context.scope.borrow_mut().set(name, obj);
                         }
@@ -1265,6 +1286,20 @@ fn compile_expression(expr: &JsExpression, out: &mut Vec<Instruction>) {
             }
             out.push(Instruction::Call(name.clone(), args.len()));
         }
+        JsExpression::ArrayLiteral(elements) => {
+            for element in elements {
+                compile_expression(element, out);
+            }
+            out.push(Instruction::BuildArray(elements.len()));
+        }
+        JsExpression::ObjectLiteral(properties) => {
+            for (_, value) in properties {
+                compile_expression(value, out);
+            }
+            out.push(Instruction::BuildObject(
+                properties.iter().map(|(key, _)| key.clone()).collect(),
+            ));
+        }
         JsExpression::MemberAccess(object, member) => {
             compile_expression(object, out);
             out.push(Instruction::MemberAccess(member.clone()));
@@ -1324,7 +1359,7 @@ fn execute_bytecode_flow(program: &BytecodeProgram, context: &JsExecutionContext
             Instruction::PushLiteral(value) => stack.push(value.clone()),
             Instruction::PushUndefined => stack.push(JsValue::Undefined),
             Instruction::LoadIdentifier(name) => {
-                if let Some(value) = builtins::resolve_global(name) {
+                if let Some(value) = builtins::global_property(name) {
                     stack.push(value);
                 } else {
                     stack.push(
@@ -1372,6 +1407,8 @@ fn execute_bytecode_flow(program: &BytecodeProgram, context: &JsExecutionContext
                     "+" => left.add(&right),
                     "-" => JsValue::Number(left.to_number() - right.to_number()),
                     "*" => JsValue::Number(left.to_number() * right.to_number()),
+                    "/" => JsValue::Number(left.to_number() / right.to_number()),
+                    "%" => JsValue::Number(left.to_number() % right.to_number()),
                     "==" => left.equals(&right),
                     "!=" => left.not_equals(&right),
                     "===" => left.strict_equals(&right),
@@ -1409,8 +1446,7 @@ fn execute_bytecode_flow(program: &BytecodeProgram, context: &JsExecutionContext
             }
             Instruction::Call(name, arg_count) => {
                 let args = pop_args(&mut stack, *arg_count);
-                let result = if let Some(value) = builtins::call_global_function(name, args.clone())
-                {
+                let result = if let Some(value) = builtins::call_global(name, args.clone()) {
                     value
                 } else if let Some(func_value) = context.scope.borrow().get(name) {
                     if let Some(func) = func_value.as_function() {
@@ -1426,6 +1462,21 @@ fn execute_bytecode_flow(program: &BytecodeProgram, context: &JsExecutionContext
                     JsValue::Undefined
                 };
                 stack.push(result);
+            }
+            Instruction::BuildArray(element_count) => {
+                let mut elements = Vec::with_capacity(*element_count);
+                for _ in 0..*element_count {
+                    elements.push(stack.pop().unwrap_or(JsValue::Undefined));
+                }
+                elements.reverse();
+                stack.push(JsValue::Array(elements));
+            }
+            Instruction::BuildObject(keys) => {
+                let mut object = HashMap::new();
+                for key in keys.iter().rev() {
+                    object.insert(key.clone(), stack.pop().unwrap_or(JsValue::Undefined));
+                }
+                stack.push(JsValue::Object(object));
             }
             Instruction::MemberAccess(member) => {
                 let obj = stack.pop().unwrap_or(JsValue::Undefined);
@@ -1449,7 +1500,7 @@ fn execute_bytecode_flow(program: &BytecodeProgram, context: &JsExecutionContext
             } => {
                 let args = pop_args(&mut stack, *arg_count);
                 if let Some(result) =
-                    builtins::try_call_named_method(object_name, method, args.clone())
+                    builtins::call_global_method(object_name, method, args.clone())
                 {
                     stack.push(result);
                 } else {
@@ -1476,7 +1527,8 @@ fn execute_bytecode_flow(program: &BytecodeProgram, context: &JsExecutionContext
                 member,
             } => {
                 let value = stack.pop().unwrap_or(JsValue::Undefined);
-                if let Some(mut obj) = context.scope.borrow().get(object_name) {
+                let existing = context.scope.borrow().get(object_name);
+                if let Some(mut obj) = existing {
                     obj.set_property(member, value.clone());
                     context.scope.borrow_mut().set(object_name, obj);
                 }
@@ -1491,7 +1543,8 @@ fn execute_bytecode_flow(program: &BytecodeProgram, context: &JsExecutionContext
             Instruction::AssignNamedIndex(name) => {
                 let value = stack.pop().unwrap_or(JsValue::Undefined);
                 let index = stack.pop().unwrap_or(JsValue::Undefined);
-                if let Some(mut obj) = context.scope.borrow().get(name) {
+                let existing = context.scope.borrow().get(name);
+                if let Some(mut obj) = existing {
                     obj.set_index(&index, value.clone());
                     context.scope.borrow_mut().set(name, obj);
                 }
@@ -1609,6 +1662,26 @@ mod tests {
     }
 
     #[test]
+    fn division_and_remainder_operators_work() {
+        let context = root_context();
+        let division = JsExpression::BinaryOp(
+            Box::new(JsExpression::Literal(JsValue::Number(10.0))),
+            "/".to_string(),
+            Box::new(JsExpression::Literal(JsValue::Number(4.0))),
+        )
+        .evaluate(&context);
+        let remainder = JsExpression::BinaryOp(
+            Box::new(JsExpression::Literal(JsValue::Number(10.0))),
+            "%".to_string(),
+            Box::new(JsExpression::Literal(JsValue::Number(4.0))),
+        )
+        .evaluate(&context);
+
+        assert!(matches!(division, JsValue::Number(n) if (n - 2.5).abs() < f64::EPSILON));
+        assert!(matches!(remainder, JsValue::Number(n) if (n - 2.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
     fn relational_nan_follows_js_behavior() {
         let nan = JsValue::Undefined;
         let one = JsValue::Number(1.0);
@@ -1703,6 +1776,23 @@ mod tests {
     }
 
     #[test]
+    fn catch_without_binding_handles_exception() {
+        let context = root_context();
+        let program = JsProgram::new(vec![JsStatement::TryCatchFinally {
+            try_block: vec![JsStatement::Throw(JsExpression::Literal(JsValue::String(
+                "ignored".to_string(),
+            )))],
+            catch_param: None,
+            catch_block: Some(vec![JsStatement::Expression(JsExpression::Literal(
+                JsValue::String("handled".to_string()),
+            ))]),
+            finally_block: None,
+        }]);
+        let out = program.execute(&context);
+        assert!(matches!(out, JsValue::String(s) if s == "handled"));
+    }
+
+    #[test]
     fn finally_runs_and_overrides_with_return() {
         let context = root_context();
         let program = JsProgram::new(vec![JsStatement::TryCatchFinally {
@@ -1719,6 +1809,93 @@ mod tests {
         }]);
         let out = program.execute(&context);
         assert!(matches!(out, JsValue::Number(n) if (n - 99.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn catch_can_rethrow_exception() {
+        let context = root_context();
+        let program = JsProgram::new(vec![JsStatement::TryCatchFinally {
+            try_block: vec![JsStatement::Throw(JsExpression::Literal(JsValue::String(
+                "original".to_string(),
+            )))],
+            catch_param: Some("e".to_string()),
+            catch_block: Some(vec![JsStatement::Throw(JsExpression::Identifier(
+                "e".to_string(),
+            ))]),
+            finally_block: None,
+        }]);
+        let out = program.execute(&context);
+        assert!(matches!(out, JsValue::String(s) if s == "original"));
+    }
+
+    #[test]
+    fn finally_preserves_rethrown_exception_when_it_completes_normally() {
+        let context = root_context();
+        let program = JsProgram::new(vec![JsStatement::TryCatchFinally {
+            try_block: vec![JsStatement::Throw(JsExpression::Literal(JsValue::String(
+                "original".to_string(),
+            )))],
+            catch_param: Some("e".to_string()),
+            catch_block: Some(vec![JsStatement::Throw(JsExpression::Identifier(
+                "e".to_string(),
+            ))]),
+            finally_block: Some(vec![JsStatement::Expression(JsExpression::Literal(
+                JsValue::String("cleanup".to_string()),
+            ))]),
+        }]);
+        let out = program.execute(&context);
+        assert!(matches!(out, JsValue::String(s) if s == "original"));
+    }
+
+    #[test]
+    fn finally_throw_overrides_prior_throw() {
+        let context = root_context();
+        let program = JsProgram::new(vec![JsStatement::TryCatchFinally {
+            try_block: vec![JsStatement::Throw(JsExpression::Literal(JsValue::String(
+                "original".to_string(),
+            )))],
+            catch_param: None,
+            catch_block: None,
+            finally_block: Some(vec![JsStatement::Throw(JsExpression::Literal(
+                JsValue::String("finally".to_string()),
+            ))]),
+        }]);
+        let out = program.execute(&context);
+        assert!(matches!(out, JsValue::String(s) if s == "finally"));
+    }
+
+    #[test]
+    fn finally_preserves_return_when_it_completes_normally() {
+        let context = root_context();
+        let program = JsProgram::new(vec![JsStatement::TryCatchFinally {
+            try_block: vec![JsStatement::Return(Some(JsExpression::Literal(
+                JsValue::Number(1.0),
+            )))],
+            catch_param: None,
+            catch_block: None,
+            finally_block: Some(vec![JsStatement::Expression(JsExpression::Literal(
+                JsValue::Number(2.0),
+            ))]),
+        }]);
+        let out = program.execute(&context);
+        assert!(matches!(out, JsValue::Number(n) if (n - 1.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn finally_throw_overrides_prior_return() {
+        let context = root_context();
+        let program = JsProgram::new(vec![JsStatement::TryCatchFinally {
+            try_block: vec![JsStatement::Return(Some(JsExpression::Literal(
+                JsValue::Number(1.0),
+            )))],
+            catch_param: None,
+            catch_block: None,
+            finally_block: Some(vec![JsStatement::Throw(JsExpression::Literal(
+                JsValue::String("finally".to_string()),
+            ))]),
+        }]);
+        let out = program.execute(&context);
+        assert!(matches!(out, JsValue::String(s) if s == "finally"));
     }
 
     #[test]
