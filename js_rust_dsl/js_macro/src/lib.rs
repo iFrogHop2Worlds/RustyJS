@@ -1,35 +1,45 @@
-
 extern crate proc_macro;
 
 use proc_macro::TokenStream;
-use quote::{quote, ToTokens, TokenStreamExt};
+use quote::quote;
 use syn::parse::{Parse, ParseStream, Result};
 use syn::punctuated::Punctuated;
-use syn::{
-    braced, parenthesized, parse_macro_input, token, Ident, Lit, LitBool, LitFloat, LitStr, Token,
-};
+use syn::{Ident, Lit, Token, braced, parenthesized, parse_macro_input};
 
-mod parser {
+pub(crate) mod parser {
     use super::*;
-    use proc_macro2::TokenStream as TokenStream2;
-    use syn::custom_keyword;
+    use syn::token::{Brace, Bracket, Paren};
+    use syn::{bracketed, custom_keyword};
 
-    custom_keyword!(function);
     custom_keyword!(_const);
+    custom_keyword!(function);
+    custom_keyword!(this);
+    custom_keyword!(catch);
+    custom_keyword!(finally);
+    custom_keyword!(throw);
 
     pub struct JsScript {
-        statements: Vec<JsStatement>,
+        pub(crate) statements: Vec<JsStatement>,
     }
 
     #[derive(Clone, Debug)]
     pub enum JsStatement {
         LetDecl(Ident, JsExpression),
-        IfStatement(JsExpression, JsBlock),
+        ConstDecl(Ident, JsExpression),
+        IfStatement(JsExpression, JsBlock, Option<JsBlock>),
+        TryCatchFinally {
+            try_block: JsBlock,
+            catch_param: Option<Ident>,
+            catch_block: Option<JsBlock>,
+            finally_block: Option<JsBlock>,
+        },
+        Throw(JsExpression),
         FunctionDecl(JsFunctionDecl),
         ForLoop(JsForLoop),
         WhileLoop(JsWhileLoop),
         DoWhileLoop(JsDoWhileLoop),
         Expression(JsExpression),
+        Return(Option<JsExpression>),
     }
 
     #[derive(Clone, Debug)]
@@ -38,12 +48,16 @@ mod parser {
         Identifier(Ident),
         This,
         BinaryOp(Box<JsExpression>, JsBinaryOp, Box<JsExpression>),
+        UnaryOp(JsUnaryOp, Box<JsExpression>),
+        LogicalOp(Box<JsExpression>, JsLogicalOp, Box<JsExpression>),
         Assignment(Ident, Box<JsExpression>),
         MemberAssignment(Box<JsExpression>, Ident, Box<JsExpression>),
+        IndexAssignment(Box<JsExpression>, Box<JsExpression>, Box<JsExpression>),
         Call(Ident, Vec<JsExpression>),
         Array(Vec<JsExpression>),
         Object(JsObject),
         MemberAccess(Box<JsExpression>, Ident),
+        IndexAccess(Box<JsExpression>, Box<JsExpression>),
         MethodCall {
             object: Box<JsExpression>,
             method: Ident,
@@ -53,7 +67,7 @@ mod parser {
 
     #[derive(Clone)]
     pub struct JsObject {
-        properties: Punctuated<JsProperty, Token![,]>,
+        pub(crate) properties: Punctuated<JsProperty, Token![,]>,
     }
 
     impl std::fmt::Debug for JsObject {
@@ -66,8 +80,8 @@ mod parser {
 
     #[derive(Clone)]
     pub struct JsProperty {
-        key: Ident,
-        value: JsExpression,
+        pub(crate) key: Ident,
+        pub(crate) value: JsExpression,
     }
 
     impl std::fmt::Debug for JsProperty {
@@ -82,12 +96,28 @@ mod parser {
     #[derive(Clone, Debug)]
     pub enum JsBinaryOp {
         Add,
+        Subtract,
+        Multiply,
         Equal,
         NotEqual,
+        StrictEqual,
+        StrictNotEqual,
         LessThan,
         GreaterThan,
         LessThanOrEqual,
         GreaterThanOrEqual,
+    }
+
+    #[derive(Clone, Debug)]
+    pub enum JsUnaryOp {
+        Negate,
+        Not,
+    }
+
+    #[derive(Clone, Debug)]
+    pub enum JsLogicalOp {
+        And,
+        Or,
     }
 
     #[derive(Clone, Debug)]
@@ -102,34 +132,34 @@ mod parser {
 
     #[derive(Clone, Debug)]
     pub struct JsBlock {
-        statements: Vec<JsStatement>,
+        pub(crate) statements: Vec<JsStatement>,
     }
 
     #[derive(Clone, Debug)]
     pub struct JsFunctionDecl {
-        name: Option<Ident>,
-        params: Vec<Ident>,
-        body: JsBlock,
+        pub(crate) name: Option<Ident>,
+        pub(crate) params: Vec<Ident>,
+        pub(crate) body: JsBlock,
     }
 
     #[derive(Clone, Debug)]
     pub struct JsWhileLoop {
-        condition: JsExpression,
-        body: JsBlock,
+        pub(crate) condition: JsExpression,
+        pub(crate) body: JsBlock,
     }
 
     #[derive(Clone, Debug)]
     pub struct JsDoWhileLoop {
-        body: JsBlock,
-        condition: JsExpression,
+        pub(crate) body: JsBlock,
+        pub(crate) condition: JsExpression,
     }
 
     #[derive(Clone, Debug)]
     pub struct JsForLoop {
-        init: Option<Box<JsStatement>>,
-        condition: Option<JsExpression>,
-        increment: Option<Box<JsExpression>>,
-        body: JsBlock,
+        pub(crate) init: Option<Box<JsStatement>>,
+        pub(crate) condition: Option<JsExpression>,
+        pub(crate) increment: Option<Box<JsExpression>>,
+        pub(crate) body: JsBlock,
     }
 
     impl Parse for JsScript {
@@ -146,23 +176,76 @@ mod parser {
         fn parse(input: ParseStream) -> Result<Self> {
             let lookahead = input.lookahead1();
             if lookahead.peek(Token![let]) || lookahead.peek(self::_const) {
-                if input.peek(Token![let]) {
+                let is_const = if input.peek(Token![let]) {
                     input.parse::<Token![let]>()?;
+                    false
                 } else {
                     input.parse::<self::_const>()?;
-                }
+                    true
+                };
                 let id: Ident = input.parse()?;
                 input.parse::<Token![=]>()?;
                 let expr: JsExpression = input.parse()?;
                 input.parse::<Token![;]>()?;
-                Ok(JsStatement::LetDecl(id, expr))
+                if is_const {
+                    Ok(JsStatement::ConstDecl(id, expr))
+                } else {
+                    Ok(JsStatement::LetDecl(id, expr))
+                }
             } else if lookahead.peek(Token![if]) {
                 input.parse::<Token![if]>()?;
                 let content;
                 parenthesized!(content in input);
                 let cond = content.parse()?;
                 let body = input.parse()?;
-                Ok(JsStatement::IfStatement(cond, body))
+                let else_body = if input.peek(Token![else]) {
+                    input.parse::<Token![else]>()?;
+                    Some(input.parse()?)
+                } else {
+                    None
+                };
+                Ok(JsStatement::IfStatement(cond, body, else_body))
+            } else if lookahead.peek(Token![try]) {
+                input.parse::<Token![try]>()?;
+                let try_block: JsBlock = input.parse()?;
+
+                let (catch_param, catch_block) = if input.peek(self::catch) {
+                    input.parse::<self::catch>()?;
+                    let content;
+                    parenthesized!(content in input);
+                    let param = if content.is_empty() {
+                        None
+                    } else {
+                        Some(content.parse::<Ident>()?)
+                    };
+                    let block: JsBlock = input.parse()?;
+                    (param, Some(block))
+                } else {
+                    (None, None)
+                };
+
+                let finally_block = if input.peek(self::finally) {
+                    input.parse::<self::finally>()?;
+                    Some(input.parse::<JsBlock>()?)
+                } else {
+                    None
+                };
+
+                if catch_block.is_none() && finally_block.is_none() {
+                    return Err(input.error("try requires catch and/or finally"));
+                }
+
+                Ok(JsStatement::TryCatchFinally {
+                    try_block,
+                    catch_param,
+                    catch_block,
+                    finally_block,
+                })
+            } else if lookahead.peek(self::throw) {
+                input.parse::<self::throw>()?;
+                let expr: JsExpression = input.parse()?;
+                input.parse::<Token![;]>()?;
+                Ok(JsStatement::Throw(expr))
             } else if lookahead.peek(function) {
                 Ok(JsStatement::FunctionDecl(input.parse()?))
             } else if lookahead.peek(Token![for]) {
@@ -171,6 +254,15 @@ mod parser {
                 Ok(JsStatement::WhileLoop(input.parse()?))
             } else if lookahead.peek(Token![do]) {
                 Ok(JsStatement::DoWhileLoop(input.parse()?))
+            } else if input.peek(Token![return]) {
+                input.parse::<Token![return]>()?;
+                let expr = if input.peek(Token![;]) {
+                    None
+                } else {
+                    Some(input.parse::<JsExpression>()?)
+                };
+                input.parse::<Token![;]>()?;
+                Ok(JsStatement::Return(expr))
             } else {
                 let expr = input.parse()?;
                 input.parse::<Token![;]>()?;
@@ -179,92 +271,161 @@ mod parser {
         }
     }
 
+    fn parse_postfix_expression(input: ParseStream) -> Result<JsExpression> {
+        let mut expr = parse_primary_expression(input)?;
+
+        loop {
+            if input.peek(Token![.]) {
+                input.parse::<Token![.]>()?;
+                let member: Ident = input.parse()?;
+
+                if input.peek(Paren) {
+                    // Method call
+                    let content;
+                    parenthesized!(content in input);
+                    let args = if content.is_empty() {
+                        Vec::new()
+                    } else {
+                        Punctuated::<JsExpression, Token![,]>::parse_terminated(&content)?
+                            .into_iter()
+                            .collect()
+                    };
+
+                    expr = JsExpression::MethodCall {
+                        object: Box::new(expr),
+                        method: member,
+                        args,
+                    };
+                } else {
+                    // Member access
+                    expr = JsExpression::MemberAccess(Box::new(expr), member);
+                }
+            } else if input.peek(Bracket) {
+                let content;
+                bracketed!(content in input);
+                let index: JsExpression = content.parse()?;
+                expr = JsExpression::IndexAccess(Box::new(expr), Box::new(index));
+            } else {
+                break;
+            }
+        }
+
+        Ok(expr)
+    }
+
     fn parse_primary_expression(input: ParseStream) -> Result<JsExpression> {
+        if input.peek(Paren) {
+            let content;
+            parenthesized!(content in input);
+            return content.parse();
+        }
+
+        if input.peek(this) {
+            input.parse::<this>()?;
+            return Ok(JsExpression::This);
+        }
+
         if input.peek(function) {
             let func: JsFunctionDecl = input.parse()?;
             return Ok(JsExpression::Literal(JsLiteral::Function(func)));
         }
 
-        let lookahead = input.lookahead1();
-        if lookahead.peek(Lit) {
-            let lit: Lit = input.parse()?;
-            Ok(JsExpression::Literal(JsLiteral::try_from(lit)?))
-        } else if lookahead.peek(Ident) {
-            let ident: Ident = input.parse()?;
-            if ident == "this" {
-                Ok(JsExpression::This)
+        if input.peek(Bracket) {
+            let content;
+            bracketed!(content in input);
+            let elements = if content.is_empty() {
+                Vec::new()
             } else {
-                Ok(JsExpression::Identifier(ident))
-            }
-        } else if lookahead.peek(token::Paren) {
-            let content;
-            parenthesized!(content in input);
-            content.parse()
-        } else if lookahead.peek(token::Bracket) {
-            let content;
-            syn::bracketed!(content in input);
-            let mut elements = Vec::new();
-            while !content.is_empty() {
-                elements.push(content.parse()?);
-                if !content.is_empty() {
-                    content.parse::<Token![,]>()?;
-                }
-            }
-            Ok(JsExpression::Array(elements))
-        } else if lookahead.peek(token::Brace) {
-            Ok(JsExpression::Object(input.parse()?))
-        } else {
-            Err(lookahead.error())
+                Punctuated::<JsExpression, Token![,]>::parse_terminated(&content)?
+                    .into_iter()
+                    .collect()
+            };
+            return Ok(JsExpression::Array(elements));
         }
-    }
 
-    fn parse_postfix_expression(input: ParseStream) -> Result<JsExpression> {
-        let mut expr = parse_primary_expression(input)?;
-        loop {
-            if input.peek(Token![.]) {
-                input.parse::<Token![.]>()?;
-                let member: Ident = input.parse()?;
-                if input.peek(token::Paren) {
-                    let content;
-                    parenthesized!(content in input);
-                    let args = content.parse_terminated(JsExpression::parse, Token![,])?;
-                    expr = JsExpression::MethodCall {
-                        object: Box::new(expr),
-                        method: member,
-                        args: args.into_iter().collect(),
-                    };
-                } else {
-                    expr = JsExpression::MemberAccess(Box::new(expr), member);
-                }
-            } else if input.peek(token::Paren) {
+        if input.peek(Brace) {
+            let obj: JsObject = input.parse()?;
+            return Ok(JsExpression::Object(obj));
+        }
+
+        if let Ok(lit) = input.parse::<Lit>() {
+            return Ok(JsExpression::Literal(JsLiteral::try_from(lit)?));
+        }
+
+        if input.peek(Ident) {
+            let ident: Ident = input.parse()?;
+
+            return if input.peek(Paren) {
+                // Function call
                 let content;
                 parenthesized!(content in input);
-                let args_parser = Punctuated::<JsExpression, Token![,]>::parse_terminated;
-                let args = args_parser(&content)?;
-                expr = JsExpression::Call(
-                    match expr {
-                        JsExpression::Identifier(id) => id,
-                        _ => return Err(syn::Error::new_spanned(expr.to_token_stream(), "Expected function name")),
-                    },
-                    args.into_iter().collect(),
-                );
+                let args = if content.is_empty() {
+                    Vec::new()
+                } else {
+                    Punctuated::<JsExpression, Token![,]>::parse_terminated(&content)?
+                        .into_iter()
+                        .collect()
+                };
+                Ok(JsExpression::Call(ident, args))
             } else {
-                break;
-            }
+                if ident == "this" {
+                    Ok(JsExpression::This)
+                } else if ident == "null" {
+                    Ok(JsExpression::Literal(JsLiteral::Null))
+                } else if ident == "undefined" {
+                    Ok(JsExpression::Literal(JsLiteral::Undefined))
+                } else {
+                    Ok(JsExpression::Identifier(ident))
+                }
+                //Ok(JsExpression::Identifier(ident))
+            };
         }
+
+        Err(input.error("expected expression"))
+    }
+
+    fn parse_unary_expression(input: ParseStream) -> Result<JsExpression> {
+        if input.peek(Token![-]) {
+            input.parse::<Token![-]>()?;
+            let expr = parse_unary_expression(input)?;
+            return Ok(JsExpression::UnaryOp(JsUnaryOp::Negate, Box::new(expr)));
+        }
+        if input.peek(Token![!]) {
+            input.parse::<Token![!]>()?;
+            let expr = parse_unary_expression(input)?;
+            return Ok(JsExpression::UnaryOp(JsUnaryOp::Not, Box::new(expr)));
+        }
+        parse_postfix_expression(input)
+    }
+
+    fn parse_multiplicative_expression(input: ParseStream) -> Result<JsExpression> {
+        let mut expr = parse_unary_expression(input)?;
+
+        while input.peek(Token![*]) {
+            input.parse::<Token![*]>()?;
+            let right = parse_unary_expression(input)?;
+            expr = JsExpression::BinaryOp(Box::new(expr), JsBinaryOp::Multiply, Box::new(right));
+        }
+
         Ok(expr)
     }
 
     fn parse_additive_expression(input: ParseStream) -> Result<JsExpression> {
-        let mut expr = parse_postfix_expression(input)?;
-        while input.peek(Token![+]) {
-            let op = match input.parse::<Token![+]>() {
-                Ok(_) => JsBinaryOp::Add,
-                Err(e) => return Err(e),
-            };
-            let right = parse_postfix_expression(input)?;
-            expr = JsExpression::BinaryOp(Box::new(expr), op, Box::new(right));
+        let mut expr = parse_multiplicative_expression(input)?; // Change this line
+
+        while input.peek(Token![+]) || input.peek(Token![-]) {
+            if input.peek(Token![+]) {
+                input.parse::<Token![+]>()?;
+                let right = parse_multiplicative_expression(input)?; // Change this line
+                expr = JsExpression::BinaryOp(Box::new(expr), JsBinaryOp::Add, Box::new(right));
+            } else {
+                input.parse::<Token![-]>()?;
+                let right = parse_multiplicative_expression(input)?; // Change this line
+                expr =
+                    JsExpression::BinaryOp(Box::new(expr), JsBinaryOp::Subtract, Box::new(right));
+            }
         }
+
         Ok(expr)
     }
 
@@ -279,10 +440,20 @@ mod parser {
         {
             let op = if input.peek(Token![==]) {
                 input.parse::<Token![==]>()?;
-                JsBinaryOp::Equal
+                if input.peek(Token![=]) {
+                    input.parse::<Token![=]>()?;
+                    JsBinaryOp::StrictEqual
+                } else {
+                    JsBinaryOp::Equal
+                }
             } else if input.peek(Token![!=]) {
                 input.parse::<Token![!=]>()?;
-                JsBinaryOp::NotEqual
+                if input.peek(Token![=]) {
+                    input.parse::<Token![=]>()?;
+                    JsBinaryOp::StrictNotEqual
+                } else {
+                    JsBinaryOp::NotEqual
+                }
             } else if input.peek(Token![<=]) {
                 input.parse::<Token![<=]>()?;
                 JsBinaryOp::LessThanOrEqual
@@ -296,7 +467,10 @@ mod parser {
                 input.parse::<Token![>]>()?;
                 JsBinaryOp::GreaterThan
             } else {
-                return Err(syn::Error::new(input.span(), "Unsupported comparison operator"));
+                return Err(syn::Error::new(
+                    input.span(),
+                    "Unsupported comparison operator",
+                ));
             };
             let right = parse_additive_expression(input)?;
             expr = JsExpression::BinaryOp(Box::new(expr), op, Box::new(right));
@@ -304,28 +478,59 @@ mod parser {
         Ok(expr)
     }
 
-    fn parse_assignment_expression(input: ParseStream) -> Result<JsExpression> {
-        let left = parse_comparison_expression(input)?;
-        if input.peek(Token![=]) {
-            input.parse::<Token![=]>()?;
-            let right = parse_assignment_expression(input)?;
+    fn parse_logical_and_expression(input: ParseStream) -> Result<JsExpression> {
+        let mut expr = parse_comparison_expression(input)?;
+        while input.peek(Token![&&]) {
+            input.parse::<Token![&&]>()?;
+            let right = parse_comparison_expression(input)?;
+            expr = JsExpression::LogicalOp(Box::new(expr), JsLogicalOp::And, Box::new(right));
+        }
+        Ok(expr)
+    }
 
-            return match left {
-                JsExpression::Identifier(id) => {
-                    Ok(JsExpression::Assignment(id, Box::new(right)))
+    fn parse_logical_or_expression(input: ParseStream) -> Result<JsExpression> {
+        let mut expr = parse_logical_and_expression(input)?;
+        while input.peek(Token![||]) {
+            input.parse::<Token![||]>()?;
+            let right = parse_logical_and_expression(input)?;
+            expr = JsExpression::LogicalOp(Box::new(expr), JsLogicalOp::Or, Box::new(right));
+        }
+        Ok(expr)
+    }
+
+    fn parse_assignment_expression(input: ParseStream) -> Result<JsExpression> {
+        let expr = parse_logical_or_expression(input)?;
+
+        if input.peek(Token![=]) && !input.peek(Token![==]) {
+            input.parse::<Token![=]>()?;
+            let value = parse_assignment_expression(input)?;
+
+            match &expr {
+                // Use a reference here
+                JsExpression::Identifier(ident) => {
+                    return Ok(JsExpression::Assignment(ident.clone(), Box::new(value)));
                 }
                 JsExpression::MemberAccess(obj, prop) => {
-                    Ok(JsExpression::MemberAssignment(obj, prop, Box::new(right)))
+                    return Ok(JsExpression::MemberAssignment(
+                        obj.clone(),
+                        prop.clone(),
+                        Box::new(value),
+                    ));
+                }
+                JsExpression::IndexAccess(obj, index) => {
+                    return Ok(JsExpression::IndexAssignment(
+                        obj.clone(),
+                        index.clone(),
+                        Box::new(value),
+                    ));
                 }
                 _ => {
-                    Err(syn::Error::new_spanned(
-                        left.to_token_stream(),
-                        "Invalid assignment target",
-                    ))
+                    // For any other expression type, we can't do assignment, fall through
                 }
             }
         }
-        Ok(left)
+
+        Ok(expr) // expr is still available since we only borrowed it above
     }
 
     impl Parse for JsExpression {
@@ -470,526 +675,32 @@ mod parser {
             Ok(JsProperty { key, value })
         }
     }
-
-    impl ToTokens for JsScript {
-        fn to_tokens(&self, tokens: &mut TokenStream2) {
-            let statements = &self.statements;
-            tokens.extend(quote! {
-                #(#statements)*
-            });
-        }
-    }
-
-    impl ToTokens for JsStatement {
-        fn to_tokens(&self, tokens: &mut TokenStream2) {
-            match self {
-                JsStatement::LetDecl(ident, expr) => {
-                    tokens.extend(quote! {
-                        {
-                            let value = #expr;
-                            let mut scope_borrow = scope.borrow_mut();
-                            scope_borrow.insert(String::from(stringify!(#ident)), value);
-                        }
-                    });
-                }
-                JsStatement::FunctionDecl(func) => {
-                    if let Some(name) = &func.name {
-                        let params = &func.params;
-                        let body_str = format!("{{ /* function body */ }}");
-                        tokens.extend(quote! {
-                            {
-                                let mut scope_borrow = scope.borrow_mut();
-                                scope_borrow.insert(String::from(stringify!(#name)), JsValue::Function(JsFunction::new(
-                                    vec![#(String::from(stringify!(#params))),*],
-                                    Vec::new(),
-                                    #body_str.to_string()
-                                )));
-                            }
-                        });
-                    }
-                }
-
-                JsStatement::IfStatement(cond, body) => {
-                    tokens.extend(quote! {
-                        if (#cond).to_bool() #body
-                    });
-                }
-                JsStatement::ForLoop(fl) => {
-                    tokens.extend(quote! { #fl; });
-                }
-                JsStatement::WhileLoop(wl) => {
-                    tokens.extend(quote! { #wl; });
-                }
-                JsStatement::DoWhileLoop(dwl) => {
-                    tokens.extend(quote! { #dwl; });
-                }
-                JsStatement::Expression(expr) => {
-                    tokens.extend(quote! { #expr; });
-                }
-            }
-        }
-    }
-
-
-    impl ToTokens for JsExpression {
-        fn to_tokens(&self, tokens: &mut TokenStream2) {
-            match self {
-                JsExpression::Literal(lit) => {
-                    tokens.extend(quote! { #lit });
-                }
-                JsExpression::This => {
-                    tokens.extend(quote! {
-                    {
-                        if let Some(this_ref) = this_context {
-                            this_ref.borrow().clone()
-                        } else {
-                            JsValue::Undefined
-                        }
-                    }
-                });
-                }
-                JsExpression::Identifier(ident) => {
-                    tokens.extend(quote! {
-                    {
-                        let scope_borrow = scope.borrow();
-                        scope_borrow.get(stringify!(#ident)).unwrap_or(&JsValue::Undefined).clone()
-                    }
-                });
-                }
-                JsExpression::MemberAssignment(_obj, _prop, value) => {
-                    tokens.extend(quote! {
-                    {
-                        let new_value = #value;
-                        new_value
-                    }
-                });
-                }
-                JsExpression::BinaryOp(left, op, right) => {
-                    let method_name = match op {
-                        JsBinaryOp::Add => quote! { add },
-                        JsBinaryOp::Equal => quote! { equals },
-                        JsBinaryOp::NotEqual => quote! { not_equals },
-                        JsBinaryOp::LessThan => quote! { less_than },
-                        JsBinaryOp::GreaterThan => quote! { greater_than },
-                        JsBinaryOp::LessThanOrEqual => quote! { less_than_or_equal },
-                        JsBinaryOp::GreaterThanOrEqual => quote! { greater_than_or_equal },
-                    };
-                    tokens.extend(quote! {
-                    (#left).#method_name(&#right)
-                });
-                }
-                JsExpression::Assignment(ident, expr) => {
-                    tokens.extend(quote! {
-                    {
-                        let value = #expr;
-                        {
-                            let mut scope_borrow = scope.borrow_mut();
-                            scope_borrow.insert(String::from(stringify!(#ident)), value.clone());
-                        }
-                        value
-                    }
-                });
-                }
-                JsExpression::Call(ident, args) => {
-                    tokens.extend(quote! {
-                    {
-                        let args_vec = vec![#(#args),*];
-                        let scope_borrow = scope.borrow();
-                        if let Some(JsValue::Function(func_ref)) = scope_borrow.get(stringify!(#ident)) {
-                            let func_clone = func_ref.clone();
-                            drop(scope_borrow);
-                            func_clone.execute(&args_vec, &scope, None)
-                        } else {
-                            JsValue::Undefined
-                        }
-                    }
-                });
-                }
-                JsExpression::Array(elements) => {
-                    tokens.extend(quote! {
-                    JsValue::Array(vec![#(#elements),*])
-                });
-                }
-                JsExpression::Object(obj) => {
-                    tokens.extend(quote! { #obj });
-                }
-                JsExpression::MemberAccess(obj, member) => {
-                    tokens.extend(quote! {
-                    {
-                        let obj_val = #obj;
-                        obj_val.get_property(stringify!(#member))
-                    }
-                });
-                }
-                JsExpression::MethodCall { object, method, args } => {
-                    if let JsExpression::Identifier(obj_ident) = object.as_ref() {
-                        if obj_ident == "console" && method == "log" {
-                            tokens.extend(quote! {
-                            {
-                                let console_args = vec![#(#args),*];
-                                console_log(console_args);
-                                JsValue::Undefined
-                            }
-                        });
-                            return;
-                        }
-                    }
-
-                    //array methods
-                    let method_str = method.to_string();
-                    if method_str == "push" || method_str == "pop" {
-                        if let JsExpression::Identifier(obj_ident) = object.as_ref() {
-                            if method_str == "push" {
-                                tokens.extend(quote! {
-                                    {
-                                    let method_args = vec![#(#args),*];
-                                    let result = {
-                                        let mut scope_borrow = scope.borrow_mut();
-                                        if let Some(value) = scope_borrow.get_mut(stringify!(#obj_ident)) {
-                                            if let Some(arg) = method_args.into_iter().next() {
-                                                value.push(arg)
-                                            } else {
-                                                JsValue::Undefined
-                                            }
-                                        } else {
-                                            JsValue::Undefined
-                                        }
-                                    };
-                                        result
-                                    }
-                                });
-                            } else {
-                                tokens.extend(quote! {
-                                    {
-                                        let result = {
-                                            let mut scope_borrow = scope.borrow_mut();
-                                            if let Some(value) = scope_borrow.get_mut(stringify!(#obj_ident)) {
-                                                value.pop()
-                                            } else {
-                                                JsValue::Undefined
-                                            }
-                                        };
-                                        result
-                                    }
-                                });
-                            }
-
-                            return;
-                        }
-                    }
-
-                    // works for all methods
-                    if let JsExpression::Identifier(obj_ident) = object.as_ref() {
-                        tokens.extend(quote! {
-                            {
-                                let method_args = vec![#(#args),*];
-                                let method_name = stringify!(#method);
-
-                                let (method_result, updated_obj) = {
-                                    let scope_borrow = scope.borrow();
-                                    let object_val = scope_borrow.get(stringify!(#obj_ident)).unwrap_or(&JsValue::Undefined).clone();
-                                    drop(scope_borrow);
-                                    object_val.execute_method(method_name, method_args, &scope)
-                                };
-
-
-                                {
-                                    let mut scope_borrow = scope.borrow_mut();
-                                    scope_borrow.insert(stringify!(#obj_ident).to_string(), updated_obj);
-                                }
-
-                                method_result
-                            }
-                        });
-                    } else {
-                        // on expressions (not identifiers)
-                        tokens.extend(quote! {
-                            {
-                                let method_args = vec![#(#args),*];
-                                let object_val = #object;
-                                let (method_result, _updated_obj) = object_val.execute_method(stringify!(#method), method_args, &scope);
-                                method_result
-                            }
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    impl ToTokens for JsLiteral {
-        fn to_tokens(&self, tokens: &mut TokenStream2) {
-            match self {
-                JsLiteral::Number(n) => tokens.extend(quote! { JsValue::Number(#n) }),
-                JsLiteral::String(s) => tokens.extend(quote! { JsValue::String(#s.to_string()) }),
-                JsLiteral::Boolean(b) => tokens.extend(quote! { JsValue::Boolean(#b) }),
-                JsLiteral::Null => tokens.extend(quote! { JsValue::Null }),
-                JsLiteral::Undefined => tokens.extend(quote! { JsValue::Undefined }),
-                JsLiteral::Function(func) => {
-                    let params = &func.params;
-                    let body_statements = &func.body.statements;
-
-                    let runtime_statements = body_statements.iter().map(|stmt| {
-                        convert_statement_to_runtime(stmt)
-                    });
-
-                    tokens.extend(quote! {
-                    JsValue::Function(JsFunction::new(
-                        vec![#(String::from(stringify!(#params))),*],
-                        vec![#(#runtime_statements),*],
-                        format!("function({}) {{ ... }}", vec![#(stringify!(#params)),*].join(", "))
-                    ))
-                });
-                }
-            }
-        }
-    }
-
-
-    impl ToTokens for JsBlock {
-        fn to_tokens(&self, tokens: &mut TokenStream2) {
-            let stmts = &self.statements;
-            tokens.append_all(quote! {
-                {
-                    #(#stmts)*
-                }
-            });
-        }
-    }
-
-    impl ToTokens for JsWhileLoop {
-        fn to_tokens(&self, tokens: &mut TokenStream2) {
-            let cond = &self.condition;
-            let body = &self.body;
-            tokens.append_all(quote! {
-                while (#cond).to_bool() {
-                    #body
-                }
-            });
-        }
-    }
-
-    impl ToTokens for JsDoWhileLoop {
-        fn to_tokens(&self, tokens: &mut TokenStream2) {
-            let cond = &self.condition;
-            let body = &self.body;
-            tokens.append_all(quote! {
-                loop {
-                    #body
-                    if !(#cond).to_bool() {
-                        break;
-                    }
-                }
-            });
-        }
-    }
-
-    impl ToTokens for JsForLoop {
-        fn to_tokens(&self, tokens: &mut TokenStream2) {
-            let init = &self.init;
-            let condition = self
-                .condition
-                .as_ref()
-                .map_or(quote!(JsValue::Boolean(true)), |c| quote!(#c));
-            let increment = &self.increment;
-            let body = &self.body;
-
-            tokens.append_all(quote! {
-                {
-                    #init
-                    loop {
-                        if !(#condition).to_bool() {
-                            break;
-                        }
-                        #body
-                        #increment;
-                    }
-                }
-            });
-        }
-    }
-
-    impl ToTokens for JsFunctionDecl {
-        fn to_tokens(&self, tokens: &mut TokenStream2) {
-            let params = &self.params;
-            let body = &self.body;
-            if let Some(name) = &self.name {
-                tokens.extend(quote! {
-                function #name(#(#params),*) #body
-            });
-            } else {
-                tokens.extend(quote! {
-                function(#(#params),*) #body
-            });
-            }
-        }
-    }
-
-    impl ToTokens for JsObject {
-        fn to_tokens(&self, tokens: &mut TokenStream2) {
-            let properties = self.properties.iter().map(|prop| {
-                let key = prop.key.to_string();
-                let value = &prop.value;
-                quote! {
-                    map.insert(#key.to_string(), #value);
-                }
-            });
-
-            tokens.extend(quote! {
-                {
-                    let mut map = std::collections::HashMap::new();
-                    #(#properties)*
-                    JsValue::Object(map)
-                }
-            });
-        }
-    }
 }
 
-fn convert_statement_to_runtime(stmt: &parser::JsStatement) -> proc_macro2::TokenStream {
-    match stmt {
-        parser::JsStatement::Expression(expr) => {
-            let runtime_expr = convert_expression_to_runtime(expr);
-            quote! { js_runtime::JsStatement::Expression(#runtime_expr) }
-        }
-        parser::JsStatement::LetDecl(ident, expr) => {
-            let ident_str = ident.to_string();
-            let runtime_expr = convert_expression_to_runtime(expr);
-            quote! { js_runtime::JsStatement::Assignment(#ident_str.to_string(), #runtime_expr) }
-        }
-        parser::JsStatement::FunctionDecl(_) => {
-            // function declarations at statement level arent handled in object methods
-            quote! { js_runtime::JsStatement::Expression(js_runtime::JsExpression::Literal(js_runtime::JsValue::Undefined)) }
-        }
-        parser::JsStatement::IfStatement(cond, _body) => {
-            let runtime_cond = convert_expression_to_runtime(cond);
-            // converts to an expression for now
-            quote! { js_runtime::JsStatement::Expression(#runtime_cond) }
-        }
-        _ => quote! { js_runtime::JsStatement::Expression(js_runtime::JsExpression::Literal(js_runtime::JsValue::Undefined)) }
-    }
-}
-
-fn convert_expression_to_runtime(expr: &parser::JsExpression) -> proc_macro2::TokenStream {
-    match expr {
-        parser::JsExpression::Literal(lit) => {
-            match lit {
-                parser::JsLiteral::String(s) => quote! { js_runtime::JsExpression::Literal(js_runtime::JsValue::String(#s.to_string())) },
-                parser::JsLiteral::Number(n) => quote! { js_runtime::JsExpression::Literal(js_runtime::JsValue::Number(#n)) },
-                parser::JsLiteral::Boolean(b) => quote! { js_runtime::JsExpression::Literal(js_runtime::JsValue::Boolean(#b)) },
-                parser::JsLiteral::Null => quote! { js_runtime::JsExpression::Literal(js_runtime::JsValue::Null) },
-                parser::JsLiteral::Undefined => quote! { js_runtime::JsExpression::Literal(js_runtime::JsValue::Undefined) },
-                _ => quote! { js_runtime::JsExpression::Literal(js_runtime::JsValue::Undefined) }
-            }
-        }
-        parser::JsExpression::Identifier(ident) => {
-            let ident_str = ident.to_string();
-            quote! { js_runtime::JsExpression::Identifier(#ident_str.to_string()) }
-        }
-        parser::JsExpression::This => {
-            quote! { js_runtime::JsExpression::This }
-        }
-        parser::JsExpression::BinaryOp(left, op, right) => {
-            let left_runtime = convert_expression_to_runtime(left);
-            let right_runtime = convert_expression_to_runtime(right);
-            let op_str = match op {
-                parser::JsBinaryOp::Add => "+",
-                parser::JsBinaryOp::Equal => "==",
-                parser::JsBinaryOp::NotEqual => "!=",
-                parser::JsBinaryOp::LessThan => "<",
-                parser::JsBinaryOp::GreaterThan => ">",
-                parser::JsBinaryOp::LessThanOrEqual => "<=",
-                parser::JsBinaryOp::GreaterThanOrEqual => ">=",
-            };
-            quote! {
-                js_runtime::JsExpression::BinaryOp(
-                    Box::new(#left_runtime),
-                    #op_str.to_string(),
-                    Box::new(#right_runtime)
-                )
-            }
-        }
-        parser::JsExpression::Assignment(ident, expr) => {
-            let ident_str = ident.to_string();
-            let runtime_expr = convert_expression_to_runtime(expr);
-            quote! {
-                js_runtime::JsExpression::Call(
-                    "__assign__".to_string(),
-                    vec![
-                        js_runtime::JsExpression::Literal(js_runtime::JsValue::String(#ident_str.to_string())),
-                        #runtime_expr
-                    ]
-                )
-            }
-        }
-        parser::JsExpression::MemberAssignment(obj, prop, value) => {
-            let obj_runtime = convert_expression_to_runtime(obj);
-            let prop_str = prop.to_string();
-            let value_runtime = convert_expression_to_runtime(value);
-
-            // convert this.prop = value to a special method call
-            quote! {
-                js_runtime::JsExpression::MethodCall {
-                    object: Box::new(#obj_runtime),
-                    method: "__set_property__".to_string(),
-                    args: vec![
-                        js_runtime::JsExpression::Literal(js_runtime::JsValue::String(#prop_str.to_string())),
-                        #value_runtime
-                    ]
-                }
-            }
-        }
-        parser::JsExpression::Call(ident, args) => {
-            let ident_str = ident.to_string();
-            let runtime_args: Vec<_> = args.iter().map(convert_expression_to_runtime).collect();
-            quote! {
-                js_runtime::JsExpression::Call(
-                    #ident_str.to_string(),
-                    vec![#(#runtime_args),*]
-                )
-            }
-        }
-        parser::JsExpression::MethodCall { object, method, args } => {
-            let obj_runtime = convert_expression_to_runtime(object);
-            let method_str = method.to_string();
-            let runtime_args: Vec<_> = args.iter().map(convert_expression_to_runtime).collect();
-            quote! {
-                js_runtime::JsExpression::MethodCall {
-                    object: Box::new(#obj_runtime),
-                    method: #method_str.to_string(),
-                    args: vec![#(#runtime_args),*]
-                }
-            }
-        }
-        parser::JsExpression::MemberAccess(obj, member) => {
-            let obj_runtime = convert_expression_to_runtime(obj);
-            let member_str = member.to_string();
-            quote! {
-                js_runtime::JsExpression::MemberAccess(
-                    Box::new(#obj_runtime),
-                    #member_str.to_string()
-                )
-            }
-        }
-        _ => quote! { js_runtime::JsExpression::Literal(js_runtime::JsValue::Undefined) }
-    }
-}
-
+mod ir;
 
 #[proc_macro]
 pub fn js(input: TokenStream) -> TokenStream {
     let script = parse_macro_input!(input as parser::JsScript);
 
+    let runtime_statements: Vec<_> = script
+        .statements
+        .iter()
+        .map(ir::convert_statement_to_runtime)
+        .collect();
+
     let expanded = quote! {
         {
-            use js_runtime::{JsValue, JsFunction, console_log};
-            use std::collections::HashMap;
-            use std::cell::RefCell;
+            use js_runtime::{JsExecutionContext, JsProgram, JsScope};
 
-            let scope = RefCell::new(HashMap::<String, JsValue>::new());
-            let this_context: Option<&RefCell<JsValue>> = None;
+            let scope = JsScope::new_root();
+            let context = JsExecutionContext {
+                scope,
+                this_context: None
+            };
 
-            #script
+            let program = JsProgram::new(vec![#(#runtime_statements),*]);
+            program.execute(&context);
         }
     };
 
