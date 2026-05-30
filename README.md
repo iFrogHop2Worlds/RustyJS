@@ -1,4 +1,6 @@
 # RustyJS: JavaScript DSL & Runtime in Rust
+<img width="720" height="380" alt="RustyJsLogo" src="https://github.com/user-attachments/assets/cdc301cf-8050-4f2b-ab21-406b15e62bff" />
+
 
 A Rust-based JavaScript interpreter and compiler infrastructure designed to execute JavaScript code within Rust environments and compile JS directly to Rust binaries.
 
